@@ -1,0 +1,2 @@
+   git clone https://github.com/tu_usuario/iq-trading-bot.git
+   cd iq-trading-bot
