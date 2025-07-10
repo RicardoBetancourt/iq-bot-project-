@@ -1,0 +1,4 @@
+{
+    // Configura Git Bash como terminal predeterminada en VS Code para Windows
+    "terminal.integrated.defaultProfile.windows": "Git Bash"
+}
