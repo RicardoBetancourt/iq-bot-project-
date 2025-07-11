@@ -317,10 +317,11 @@ class BotIQTrading:
             self.email = email
             self.password = password
             self.account_type = account_type
-            self.activos = kwargs.get('activos', ["EURUSD-OTC", "GBPUSD-OTC", "EURGBP-OTC"])
+            self.activos = kwargs.get('activos', ["EURUSD-OTC", "GBPUSD-OTC", "EURCHF-OTC"])
             self.activo_actual = None
             self.tipo_cuenta = kwargs.get('tipo_cuenta', "PRACTICE")
-            
+            # --- NUEVO: Probabilidad mínima para operar ---
+            self.min_confidence = kwargs.get('min_confidence', 0.6)
             # Estrategia
             self.monto_inicial = 1.0
             self.monto_actual = self.monto_inicial
@@ -377,28 +378,35 @@ class BotIQTrading:
             raise
 
     def verificar_activos_disponibles(self):
-        """Verifica qué activos están realmente disponibles para operar"""
-        disponibles = []
+        """Obtiene solo los activos de opciones binarias (no digitales ni OTC) disponibles para operar en timeframe de 1 minuto."""
         try:
-            logging.info("Verificando activos disponibles...")
+            logging.info("Obteniendo lista de activos SOLO BINARIAS (no digitales, no OTC) para timeframe 1 minuto...")
             temp_api = IQ_Option(self.email, self.password)
+            activos_binarias = []
             if temp_api.connect():
-                for activo in self.activos:
-                    try:
-                        velas = temp_api.get_candles(activo, 60, 10, time.time())
-                        if velas:
-                            disponibles.append(activo)
-                            logging.info(f"Activo {activo} disponible")
-                        else:
-                            logging.warning(f"Activo {activo} no disponible")
-                    except Exception as e:
-                        logging.warning(f"Error verificando activo {activo}: {str(e)}")
+                all_activos = temp_api.get_all_open_time()
+                if 'binary' in all_activos:
+                    for activo, info in all_activos['binary'].items():
+                        # Filtrar solo activos que NO sean OTC y estén abiertos en binarias 1 minuto
+                        if 'OTC' not in activo and info['open'] and info['turbo']['open']:
+                            try:
+                                velas = temp_api.get_candles(activo, 60, 10, time.time())
+                                if velas and len(velas) > 0:
+                                    activos_binarias.append(activo)
+                                    logging.info(f"Activo binaria disponible: {activo}")
+                            except Exception as e:
+                                logging.warning(f"No se pudo obtener velas para {activo}: {str(e)}")
                 temp_api.disconnect()
+                if activos_binarias:
+                    self.activos = activos_binarias
+                    logging.info(f"Activos configurados SOLO BINARIAS para operar: {self.activos}")
+                    return self.activos
+                else:
+                    logging.warning("No se encontraron activos BINARIAS disponibles para 1 minuto.")
+                    return self.activos
             else:
                 logging.warning("No se pudo conectar para verificar activos")
-                return self.activos  # Si no podemos verificar, usamos todos
-            
-            return disponibles if disponibles else self.activos
+                return self.activos
         except Exception as e:
             logging.error(f"Error verificando activos: {str(e)}")
             return self.activos
@@ -447,10 +455,10 @@ class BotIQTrading:
             logging.error(f"Error configurando cuenta: {str(e)}")
             return False
 
-    def obtener_datos_historicos(self, activo, cantidad_velas=1000, return_df=False):
+    def obtener_datos_historicos(self, activo, cantidad_velas=3000, return_df=False):
         """Obtiene datos históricos para un activo específico. Si return_df=True, retorna el DataFrame procesado o None."""
         try:
-            logging.info(f"Obteniendo datos para {activo} (30s)")
+            logging.info(f"Obteniendo datos para {activo} (30s), cantidad de velas: {cantidad_velas}")
             # Cambiado a timeframe de 30 segundos
             velas = self.api.get_candles(activo, 30, cantidad_velas, time.time())
             if velas and len(velas) > 100:
@@ -859,25 +867,26 @@ class BotIQTrading:
         try:
             if not self.conectar_api():
                 return
-                
             # Ejecutar backtesting inicial
             if not self.ejecutar_backtesting_activos():
                 logging.error("Backtesting fallido. Revisar datos.")
                 return
-                
             logging.info("Bot listo para operar")
-            
             while self.ejecutando:
                 try:
                     # Seleccionar mejor activo
                     activo, condiciones = self.seleccionar_mejor_activo()
-                    
                     if activo and condiciones:
+                        # Verificar si el activo está realmente disponible en binarias 1 minuto
+                        if activo not in self.activos:
+                            logging.warning(f"El activo {activo} no está disponible en opciones binarias para 1 minuto. Se omite.")
+                            time.sleep(10)
+                            continue
                         # Actualizar datos del activo seleccionado
                         if not self.obtener_datos_historicos(activo, 300):
+                            logging.warning(f"No se pudo obtener datos históricos para {activo}. Se omite.")
                             time.sleep(20)
                             continue
-                            
                         # Verificar probabilidad mínima
                         umbral = 0.50  # Umbral más bajo que antes
                         if condiciones['probabilidad'] >= umbral:
@@ -885,22 +894,19 @@ class BotIQTrading:
                             self.ejecutar_operacion(activo, condiciones['direccion'])
                         else:
                             logging.info(f"Señal débil para {activo}. Prob: {condiciones['probabilidad']:.2%} < {umbral:.2%}")
-                    
+                    else:
+                        logging.info("No se encontró activo óptimo para operar en este ciclo.")
                     # Rotación de modelos cada 2 horas
                     if time.time() - getattr(self, 'ultimo_entrenamiento', 0) > 7200:
                         self.ejecutar_backtesting_activos()
                         self.ultimo_entrenamiento = time.time()
-                    
                     time.sleep(15)
-                    
                 except KeyboardInterrupt:
                     self.ejecutando = False
                     logging.info("Detención solicitada por usuario")
-                    
                 except Exception as e:
                     logging.error(f"Error en bucle principal: {str(e)}")
                     time.sleep(30)
-                    
         finally:
             self.detener()
 
@@ -933,7 +939,7 @@ if __name__ == "__main__":
     
     try:
         # Configurar activos principales (no OTC)
-        activos_principales = ["EURUSD-OTC", "GBPUSD-OTC", "EURGBP-OTC"]
+        activos_principales = ["EURUSD-OTC", "GBPUSD-OTC", "EURCHF-OTC"]
         
         # Iniciar bot con gestión de riesgo conservadora
         bot = BotIQTrading(
